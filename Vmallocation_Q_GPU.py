@@ -6,14 +6,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
 
-def load_vm_requests(db_path):
+def load_vm_requests(db_path, limit=1000):  # new 'limit' parameter
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT vmId, vmTypeId, starttime, endtime FROM vm")
+        cursor.execute("SELECT vmId, vmTypeId, starttime, endtime FROM vm LIMIT ?", (limit,))  # limit the number of rows
         vm_requests = np.array(cursor.fetchall())
         conn.close()
         return vm_requests
@@ -22,17 +20,18 @@ def load_vm_requests(db_path):
         return None
 
 
-def load_vm_types(db_path):
+def load_vm_types(db_path, limit=1000):  # new 'limit' parameter
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, core, memory FROM vmType")
+        cursor.execute("SELECT id, core, memory FROM vmType LIMIT ?", (limit,))  # limit the number of rows
         vm_types = np.array(cursor.fetchall())
         conn.close()
         return vm_types
     except sqlite3.Error as e:
         print(f"An error occurred: {e}")
         return None
+
 
 
 class QNetwork(nn.Module):
@@ -99,6 +98,13 @@ class VmAllocationEnv(gym.Env):
         uniform_allocation = 1 - np.abs(occupied_vms / total_vms - 0.5)  # Uniform allocation reward
         reward = uniform_allocation
         return reward
+
+    def calculate_occupancy_rate(self):
+        # Calculate occupancy rate
+        total_vms = len(self.current_vms)
+        occupied_vms = np.sum(self.current_vms > 0)
+        occupancy_rate = occupied_vms / total_vms
+        return occupancy_rate
 
     def get_state(self):
         return self.current_vms
@@ -172,9 +178,13 @@ else:
             state = next_state
             total_reward += reward
 
-        print(f"Total Reward: {total_reward:.2f}")
-        print("----------------------")
 
-    # Save the dataset to a text file
-    np.savetxt("Allocated_vms.txt", env.vm_requests, delimiter=",", fmt="%s")
-    print("Allocated_vms.txt")
+                # Calculate and save occupancy rate at the end of the episode
+        occupancy_rate = env.calculate_occupancy_rate()
+        with open(f"Occupancy_rate_episode_{episode+1}.txt", "w") as f:
+            f.write(f"{occupancy_rate:.2f}\n")   
+
+        print(f"Total Reward: {total_reward:.2f}")
+        print("———————————")
+
+
