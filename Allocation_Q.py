@@ -2,13 +2,16 @@ import gym
 from gym import spaces
 import numpy as np
 import sqlite3
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 
-def load_vm_requests(db_path):
+def load_vm_requests(db_path, limit=1000):  # new 'limit' parameter
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT vmId, vmTypeId, starttime, endtime FROM vm")
+        cursor.execute("SELECT vmId, vmTypeId, starttime, endtime FROM vm LIMIT ?", (limit,))  # limit the number of rows
         vm_requests = np.array(cursor.fetchall())
         conn.close()
         return vm_requests
@@ -17,18 +20,33 @@ def load_vm_requests(db_path):
         return None
 
 
-def load_vm_types(db_path):
+def load_vm_types(db_path, limit=1000):  # new 'limit' parameter
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, core, memory FROM vmType")
+        cursor.execute("SELECT id, core, memory FROM vmType LIMIT ?", (limit,))  # limit the number of rows
         vm_types = np.array(cursor.fetchall())
         conn.close()
         return vm_types
     except sqlite3.Error as e:
         print(f"An error occurred: {e}")
         return None
-    
+
+
+
+class QNetwork(nn.Module):
+    def __init__(self, n_states, n_actions):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(n_states, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, n_actions)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
 
 class VmAllocationEnv(gym.Env):
     def __init__(self, vm_requests, vm_types):
@@ -74,13 +92,19 @@ class VmAllocationEnv(gym.Env):
         done = self.current_step >= len(self.vm_requests)
         return self.get_state(), reward, done, {}
 
-
     def calculate_reward(self):
         total_vms = len(self.current_vms)
         occupied_vms = np.sum(self.current_vms > 0)
         uniform_allocation = 1 - np.abs(occupied_vms / total_vms - 0.5)  # Uniform allocation reward
         reward = uniform_allocation
         return reward
+
+    def calculate_occupancy_rate(self):
+        # Calculate occupancy rate
+        total_vms = len(self.current_vms)
+        occupied_vms = np.sum(self.current_vms > 0)
+        occupancy_rate = occupied_vms / total_vms
+        return occupancy_rate
 
     def get_state(self):
         return self.current_vms
@@ -98,31 +122,35 @@ class QLearningAgent:
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
         self.exploration_rate = exploration_rate
-        self.q_table = np.zeros((n_states, n_actions))
+
+        self.q_network = QNetwork(n_states, n_actions)
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
 
     def get_action(self, state):
-        state = state.flatten()
-        state = state.astype(int)  # Convert state to integers
+        state = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         if np.random.uniform(0, 1) < self.exploration_rate:
             action = np.random.choice(self.n_actions)
             print(f"Exploration: Selected random action {action}")
         else:
-            action = np.argmax(self.q_table[state])
-            print(f"Exploitation: Selected action {action} with highest Q-value")
+            with torch.no_grad():
+                q_values = self.q_network(state)
+                action = torch.argmax(q_values, dim=1).item()
+                print(f"Exploitation: Selected action {action} with highest Q-value")
         return action
 
-
-    def update_q_table(self, state, action, reward, next_state):
-        state = state.flatten()
-        state = state.astype(int)  # Convert state to integers
-        next_state = next_state.flatten()
-        next_state = next_state.astype(int)  # Convert next_state to integers
-        old_value = self.q_table[state, action]
-        next_max = np.max(self.q_table[next_state])
-        new_value = (1 - self.learning_rate) * old_value + self.learning_rate * (
-                    reward + self.discount_factor * next_max)
-        self.q_table[state, action] = new_value
-
+    def update_q_network(self, state, action, reward, next_state):
+        state = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
+        q_values = self.q_network(state)
+        q_value = q_values[0, action]
+        with torch.no_grad():
+            next_q_values = self.q_network(next_state)
+            next_max_q_value = torch.max(next_q_values)
+        target_q_value = reward + self.discount_factor * next_max_q_value
+        loss = nn.MSELoss()(q_value, target_q_value)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
 
 db_path = 'packing_trace_zone_a_v1.sqlite'  # Dataset file path
@@ -146,9 +174,17 @@ else:
         while not done:
             action = agent.get_action(state)
             next_state, reward, done, _ = env.step(action)
-            agent.update_q_table(state, action, reward, next_state)
+            agent.update_q_network(state, action, reward, next_state)
             state = next_state
             total_reward += reward
 
+
+                # Calculate and save occupancy rate at the end of the episode
+        occupancy_rate = env.calculate_occupancy_rate()
+        with open(f"Occupancy_rate_episode_{episode+1}.txt", "w") as f:
+            f.write(f"{occupancy_rate:.2f}\n")   
+
         print(f"Total Reward: {total_reward:.2f}")
-        print("----------------------")
+        print("———————————")
+
+
